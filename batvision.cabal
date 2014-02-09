@@ -1,0 +1,22 @@
+name:                batvision
+version:             0.1.0
+license:             MIT
+author:              Niklas Hambüchen <mail@nh2.me>
+maintainer:          Niklas Hambüchen <mail@nh2.me>
+build-type:          Simple
+cabal-version:       >=1.8
+homepage:            https://github.com/nh2/empty-niklas-project
+bug-reports:         https://github.com/nh2/empty-niklas-project/issues
+synopsis:            Use Kinect-like sensors to audibly "see" with your ears
+description:
+  Use Kinect-like sensors to audibly "see" with your ears
+
+
+executable batvision
+  main-is:             Main.hs
+  build-depends:       base >= 4.5
+                     , honi
+                     , bytestring >= 0.9
+                     , vector >= 0.10
+                     , ALUT >= 2.3
+                     , split >= 0.2
