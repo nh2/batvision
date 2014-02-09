@@ -2,7 +2,9 @@
 
 module Main where
 
+import           Control.Applicative
 import           Control.Concurrent
+import           Control.Exception
 import           Control.Monad
 import qualified Data.ByteString as BS
 import           Data.ByteString.Internal (toForeignPtr)
@@ -16,10 +18,10 @@ import           Data.Vector.Storable.Internal (updPtr)
 import           Data.Word
 import           Foreign.ForeignPtr (castForeignPtr)
 import           Foreign.Marshal.Array (advancePtr)
+import           Safe
 import           Sound.ALUT
 import           System.Environment (getArgs)
 import           Text.Printf (printf)
-
 
 import Honi
 import Honi.Types
@@ -30,16 +32,16 @@ main = do
   args <- getArgs
 
   case args of
+
     ["full"] -> withSource $ \source -> do
-                  numInQueue <- newIORef 0
-                  withFirstCamera (processFrame source numInQueue)
+                  withFirstCamera (processFrame source)
+
     ["point"] -> withSource $ \source -> do
-                   numInQueue <- newIORef 0
                    toneRef <- newIORef 80
-                   -- forkIO $ soundServer source toneRef
-                   forkIO $ soundPitch source toneRef
-                   withFirstCamera (processFramePoint source toneRef numInQueue)
-    _ -> error "bad args"
+                   forkIO $ soundPitchServer source toneRef
+                   withFirstCamera (processFramePoint source toneRef)
+
+    _ -> abort "batvision [full|point]"
 
 
 bsToVector :: BS.ByteString -> Vector Word16
@@ -52,8 +54,10 @@ bsToVector bs = unsafeFromForeignPtr0 (castForeignPtr fp0) len16Bits
 
 
 
-processFramePoint :: Source -> IORef Float -> IORef Int -> OniFrame -> IO ()
-processFramePoint source toneRef numInQueue frame@OniFrame{ frameWidth = w, frameHeight = h, frameData, frameStride = stride } = do
+processFramePoint :: Source -> IORef Float -> OniFrame -> IO ()
+processFramePoint source toneRef frame@OniFrame{ frameWidth = w
+                                               , frameHeight = h
+                                               , frameData } = do
 
   let vec = bsToVector frameData
 
@@ -65,7 +69,6 @@ processFramePoint source toneRef numInQueue frame@OniFrame{ frameWidth = w, fram
   print mid
 
   writeIORef toneRef (fixupPoint $ fromIntegral mid)
-  -- playSound source numInQueue (fixupPoint $ fromIntegral mid) (1/60)
 
 
 fixupPoint :: Float -> Float
@@ -80,64 +83,49 @@ fixup x
   | otherwise = max 80 (2400 - x)
 
 
-processFrame :: Source -> IORef Int -> OniFrame -> IO ()
-processFrame source numInQueue frame@OniFrame{ frameWidth = w, frameHeight = h, frameData, frameStride = stride } = do
-
-  print ("frameSensorType", frameSensorType frame)
-  print ("frameTimestamp", frameTimestamp frame)
-  print ("frameIndex", frameIndex frame)
-  print ("frameVideoMode", frameVideoMode frame)
-  print ("frameCroppingEnabled", frameCroppingEnabled frame)
-  print ("frameCropOriginX", frameCropOriginX frame)
-  print ("frameCropOriginY", frameCropOriginY frame)
+processFrame :: Source -> OniFrame -> IO ()
+processFrame source frame@OniFrame{ frameWidth = w
+                                  , frameHeight = h
+                                  , frameData
+                                  , frameStride = stride } = do
 
   let vec = bsToVector frameData
 
+  -- Print stats
+  print (w, h, stride, BS.length frameData)
+
+  putStrLn "Distance grid:"
+  printGrid vec w h 8 -- Print every 8th value
+
   -- TOOD figure out why the last column is zero
 
-  putStrLn ""
-  print (w, h, stride, BS.length frameData)
-  print (VS.length vec)
+  -- Calculate "closest" row
+  let closest = closestRows vec w
+      distances = VS.toList $ VS.reverse closest -- reverse x for cam view direction
 
-  -- Print every 8th value
-  forM_ [0..((h-1) `quot` 8)] $ \y -> do
-    forM_ (reverse [0..((w-1) `quot` 8)]) $ \x -> do
-      printf "%4d " $ vec ! (w*(y * 8) + (x * 8))
+  putStrLn "Closest line:"
+  printGrid closest w 1 8 -- Print every 8th value of the row
+  putStrLn ""
+
+  let playTime = 2.0 -- seconds
+  let frequencies = map (fixup . fromIntegral) distances
+
+  playSounds source frequencies playTime
+
+
+
+-- | Prints the grid represented by vec (w width, h height), and print
+-- every s'th data point (starting with the first one).
+-- Prints in order such that left is "left from the camera view direction".
+printGrid :: Vector Word16 -> Int -> Int -> Int -> IO ()
+printGrid vec w h s = do
+  forM_ [0..((h-1) `quot` s)] $ \y -> do
+    forM_ (reverse [0..((w-1) `quot` s)]) $ \x -> do -- reverse x for cam view direction
+      printf "%4d " $ vec ! (w*(y * s) + (x * s))
     putStrLn ""
 
-  -- Print every value
-  -- forM_ [0..h-1] $ \y -> do
-  --   -- print y
-  --   forM_ (reverse [0..w-1]) $ \x -> do
-  --     -- printf "%3d " $ frameData `BS.index` (w*y + x)
-  --     printf "%4d " $ vec ! (w*y + x)
-  --   putStrLn ""
 
-
-  putStrLn ""
-  let sums = closestRows vec w
-  sparseSums <- forM (reverse [0..((w-1) `quot` 8)]) $ \x -> do
-    printf "%4d " $ sums ! (x * 8)
-    return $ sums ! (x * 8)
-  putStrLn ""
-
-  let delay = 2.0
-
-  let distances = VS.toList $ VS.reverse sums
-
-  let playSums = map head . chunksOf 1 $ distances
-  let toPlay = map (fixup . fromIntegral) playSums
-
-  -- announcer
-  -- playSounds' source numInQueue [2000,80] $ 0.1
-
-  -- distances
-  -- print toPlay
-  playSounds' source numInQueue toPlay $ delay
-
-  -- threadDelay (delay * 1000000)
-
-
+-- | Fold all rows of v with function f. Use acc as the initial row.
 foldRows :: (VS.Storable a, VS.Storable b) => (a -> b -> a) -> Vector a -> Vector b -> Vector a
 foldRows f acc v = foldl' (\res r -> VS.zipWith f res (VS.slice (r*cols) cols v)) acc [0..rows-1]
   where
@@ -149,6 +137,8 @@ foldRows f acc v = foldl' (\res r -> VS.zipWith f res (VS.slice (r*cols) cols v)
              _      -> error "foldRows: vector to fold over is not rectangular"
 
 
+-- | Given a grid of distances, for each column calculates the closest one
+-- (avoiding 0s if possible).
 closestRows :: (VS.Storable a, Num a, Ord a) => Vector a -> Int -> Vector a
 closestRows v nCols = foldRows minNon0 (VS.replicate nCols 0) v
   where
@@ -157,81 +147,34 @@ closestRows v nCols = foldRows minNon0 (VS.replicate nCols 0) v
     minNon0 a b = min a b
 
 
+-- | Runs the give per-frame action on the first available OpenNI camera.
 withFirstCamera :: (OniFrame -> IO ()) -> IO ()
 withFirstCamera f = do
   initialize oniApiVersion
-  Right (di:_) <- getDeviceList
-  Right device <- deviceOpenInfo di
-  Right stream <- deviceCreateStream device SensorDepth
+  devs   <- right "getDeviceList"      <$> getDeviceList
+  device <- right "deviceOpenInfo"     <$> deviceOpenInfo (first devs)
+  stream <- right "deviceCreateStream" <$> deviceCreateStream device SensorDepth
   streamStart stream
   fix $ \loop ->
     streamReadFrame stream >>= \case
       Right frame -> f frame >> loop
       Left err    -> print err >> shutdown
+  where
+    right msg (Left err) = abort $ "ERROR " ++ msg ++ ": " ++ show err
+    right _   (Right x)  = x
+
+    first devs = headDef (abort "no camera devices") devs
 
 
-playSound :: Source -> IORef Int -> Float -> Float -> IO ()
-playSound source numInQueue freq duration = do
-  when (freq == 0.0) $ error "playSounds: Bad frequency of 0.0"
+-- | Loops sound, updating the frequency from `toneRef`.
+soundPitchServer :: Source -> IORef Float -> IO ()
+soundPitchServer source toneRef = do
 
-  q <- get $ buffersQueued source
-  p <- get $ buffersProcessed source
-  print ("queued", q, "processed", p)
+  let duration = 1.0 / 100
 
-
-  buf <- createBuffer $ Sine freq 0 duration
-  queueBuffers source [buf]
-
-  q <- get $ buffersQueued source
-  when (q < 5) $ do
-    queueBuffers source [buf]
-
-  q <- get $ buffersQueued source
-  p <- get $ buffersProcessed source
-  print ("queued", q, "processed", p)
-
-  -- when (p > 5) $
-  --   void $ unqueueBuffers source (5)
-  void $ unqueueBuffers source p
-
-
-  x <- readIORef numInQueue
-  when (x == 0) $ do
-    play [source]
-    writeIORef numInQueue 1
-  --   sleep (duration * 0.5)
-
-
-  when (x /= 0) $ do
-    sleep (duration )
-    -- threadDelay (floor $ duration * 1000000.0)
-    -- n <- get $ buffersProcessed source
-    -- print n
-    -- when (n > 5) $
-    --   void $ unqueueBuffers source (n-1)
-
-  q <- get $ buffersQueued source
-  p <- get $ buffersProcessed source
-  print ("queued", q, "processed", p)
-
-  -- sleep (duration )
-  print =<< (get $ sourceState source)
-
-  -- void $ unqueueBuffers source 1
-
-  -- stop [source]
-  -- x <- readIORef numInQueue
-  -- unqueueBuffers source (fromIntegral x)
-  -- writeIORef numInQueue 1
-  -- void $ unqueueBuffers source 1
-
-
-soundPitch :: Source -> IORef Float -> IO ()
-soundPitch source toneRef = do
-
-  let duration = (1.0 / 100)
-
+  -- Looping is the best way against clicks; http://benbritten.com/2010/05/04/streaming-in-openal
   loopingMode source $= Looping
+
   buf <- createBuffer $ Sine 1760 0 duration
   queueBuffers source [buf]
   play [source]
@@ -242,80 +185,16 @@ soundPitch source toneRef = do
     sleep duration
 
 
+-- | `playSounds source numInQueue freqs overDuration`:
+-- Play `freqs` equally distributed over `overDuration` seconds.
+playSounds :: Source -> [Float] -> Float -> IO ()
+playSounds source freqs overDuration = do
 
+  -- Remove finished buffers
+  stop [source]
+  unqueueBuffers source =<< get (buffersProcessed source)
 
-soundServer :: Source -> IORef Float -> IO ()
-soundServer source toneRef = forever $ do
-  freq <- readIORef toneRef
-
-  print ("freq", freq)
-
-  when (freq == 0.0) $ error "playSounds: Bad frequency of 0.0"
-
-  q <- get $ buffersQueued source
-  p <- get $ buffersProcessed source
-  print ("queued", q, "processed", p)
-
-  let duration = 0.1
-
-  buf <- createBuffer $ Sine freq 0 (duration)
-  queueBuffers source [buf]
-
-  q <- get $ buffersQueued source
-  when (q < 8) $ do
-    queueBuffers source [buf]
-    queueBuffers source [buf]
-    queueBuffers source [buf]
-    queueBuffers source [buf]
-    queueBuffers source [buf]
-
-  q <- get $ buffersQueued source
-  p <- get $ buffersProcessed source
-  print ("queued", q, "processed", p)
-
-  -- when (p > 5) $
-  --   void $ unqueueBuffers source (5)
-  void $ unqueueBuffers source p
-
-
-  state <- get $ sourceState source
-  when (state == Initial) $ do
-    putStrLn "\n\n\n\nSTARTING\n\n\n\n"
-    play [source]
-  --   sleep (duration * 0.5)
-
-
-  -- when (x /= 0) $ do
-  sleep (duration)
-  -- threadDelay (floor $ duration * 1000000.0)
-    -- threadDelay (floor $ duration * 1000000.0)
-    -- n <- get $ buffersProcessed source
-    -- print n
-    -- when (n > 5) $
-    --   void $ unqueueBuffers source (n-1)
-
-  q <- get $ buffersQueued source
-  p <- get $ buffersProcessed source
-  print ("queued", q, "processed", p)
-
-  -- sleep (duration )
-  print =<< (get $ sourceState source)
-
-  -- void $ unqueueBuffers source 1
-
-  -- stop [source]
-  -- x <- readIORef numInQueue
-  -- unqueueBuffers source (fromIntegral x)
-  -- writeIORef numInQueue 1
-  -- void $ unqueueBuffers source 1
-
-
-
-
-
-
-playSounds' :: Source -> IORef Int -> [Float] -> Float -> IO ()
-playSounds' source numInQueue freqs overDuration = do
+  -- Queue new sounds
   forM_ freqs $ \freq -> do
     let duration = overDuration / fromIntegral (length freqs)
     -- print (freq, duration)
@@ -323,15 +202,9 @@ playSounds' source numInQueue freqs overDuration = do
     buf <- createBuffer $ Sine freq 0 duration
     queueBuffers source [buf]
 
-  stop [source]
-  x <- readIORef numInQueue
-  unqueueBuffers source (fromIntegral x)
-  writeIORef numInQueue (length freqs)
-
   play [source]
 
-  -- sleep (overDuration + 0.2)
-
+  -- Pan from left to right while the sounds are played.
   let steps = [-1,-0.97..1]
   let n = fromIntegral $ length steps
   forM_ steps $ \pos -> do
@@ -339,16 +212,19 @@ playSounds' source numInQueue freqs overDuration = do
     sleep (overDuration / n)
 
 
+-- | Do something with a sound source on the first available OpenAL audio device.
 withSource :: (Source -> IO a) -> IO a
 withSource f =
   withProgNameAndArgs runALUTUsingCurrentContext $ \_ _ -> do
-    Just device <- openDevice Nothing
-    Just context <- createContext device []
-    currentContext $= Just context
+    device  <- just "no sound device"  <$> openDevice Nothing
+    context <- just "no audio context" <$> createContext device []
 
+    currentContext $= Just context
     [source] <- genObjectNames 1
 
-    x <- f source
+    x <- finally (f source) (closeDevice device)
 
-    closeDevice device
     return x
+  where
+    just _   (Just x) = x
+    just msg Nothing  = abort $ "ERROR: " ++ msg
